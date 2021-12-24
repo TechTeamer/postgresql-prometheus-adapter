@@ -36,8 +36,6 @@ var promSamples = list.New()
 
 // QueueMutex is used thread safe operations on promSamples list object.
 var QueueMutex sync.Mutex
-var vMetricIDMapMutex sync.Mutex
-var vMetricIDMap tMetricIDMap
 
 // PGWriter - Threaded writer
 type PGWriter struct {
@@ -47,7 +45,6 @@ type PGWriter struct {
 	Running     bool
 
 	valueRows [][]interface{}
-	labelRows [][]interface{}
 
 	PGWriterMutex sync.Mutex
 	logger        log.Logger
@@ -79,31 +76,19 @@ func (p *PGParser) RunPGParser(tid int, partitionScheme string, c *PGWriter) {
 				sMetric := metricString(sample.Metric)
 				ts := time.Unix(sample.Timestamp.Unix(), 0)
 				milliseconds := sample.Timestamp.UnixNano() / 1000000
+
+				i := strings.Index(sMetric, "{")
+				jsonbMap := make(map[string]interface{})
+				json.Unmarshal([]byte(sMetric[i:]), &jsonbMap)
+				c.valueRows = append(c.valueRows, []interface{}{toTimestamp(milliseconds), sMetric[:i], float64(sample.Value), jsonbMap})
+
 				if ts.Year() != p.lastPartitionTS.Year() ||
 					ts.Month() != p.lastPartitionTS.Month() ||
 					ts.Day() != p.lastPartitionTS.Day() {
 					p.lastPartitionTS = ts
 					_ = c.setupPgPartitions(partitionScheme, p.lastPartitionTS)
 				}
-				vMetricIDMapMutex.Lock()
-				id, ok := vMetricIDMap[sMetric]
-
-				if !ok {
-					var nextId int64 = int64(len(vMetricIDMap) + 1)
-					vMetricIDMap[sMetric] = nextId
-					i := strings.Index(sMetric, "{")
-					jsonbMap := make(map[string]interface{})
-					json.Unmarshal([]byte(sMetric[i:]), &jsonbMap)
-					c.labelRows = append(c.labelRows, []interface{}{int64(nextId), sMetric[:i], sMetric, jsonbMap})
-					id = nextId
-				}
-				vMetricIDMapMutex.Unlock()
-				p.valueRows = append(p.valueRows, []interface{}{int64(id), toTimestamp(milliseconds), float64(sample.Value)})
 			}
-			vMetricIDMapMutex.Lock()
-			c.valueRows = append(c.valueRows, p.valueRows...)
-			p.valueRows = nil
-			vMetricIDMapMutex.Unlock()
 			runtime.GC()
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -165,33 +150,23 @@ func (c *PGWriter) PGWriterShutdown() {
 
 // PGWriterSave save data to DB
 func (c *PGWriter) PGWriterSave() {
-	var copyCount, lblCount, rowCount int64
 	var err error
 	begin := time.Now()
-	lblCount = int64(len(c.labelRows))
 	c.PGWriterMutex.Lock()
-	if lblCount > 0 {
-		copyCount, err := c.DB.CopyFrom(context.Background(), pgx.Identifier{"metric_labels"}, []string{"metric_id", "metric_name", "metric_name_label", "metric_labels"}, pgx.CopyFromRows(c.labelRows))
-		c.labelRows = nil
-		if err != nil {
-			level.Error(c.logger).Log("msg", "COPY failed for metric_labels", "err", err)
-		}
-		if copyCount != lblCount {
-			level.Error(c.logger).Log("msg", "All rows not copied metric_labels", "err", err)
-		}
-	}
-	copyCount, err = c.DB.CopyFrom(context.Background(), pgx.Identifier{"metric_values"}, []string{"metric_id", "metric_time", "metric_value"}, pgx.CopyFromRows(c.valueRows))
-	rowCount = int64(len(c.valueRows))
+	rowCount := int64(len(c.valueRows))
+	copyCount, err := c.DB.CopyFrom(context.Background(), pgx.Identifier{"metrics"}, []string{"time", "name", "value", "labels"}, pgx.CopyFromRows(c.valueRows))
 	c.valueRows = nil
 	c.PGWriterMutex.Unlock()
+
 	if err != nil {
-		level.Error(c.logger).Log("msg", "COPY failed for metric_values", "err", err)
+		level.Error(c.logger).Log("msg", "COPY failed for metrics", "err", err)
 	}
 	if copyCount != rowCount {
-		level.Error(c.logger).Log("msg", "All rows not copied metric_values", "err", err)
+		level.Error(c.logger).Log("msg", "All rows not copied metrics", "err", err)
 	}
+
 	duration := time.Since(begin).Seconds()
-	level.Info(c.logger).Log("metric", fmt.Sprintf("BGWriter%d: Processed samples count,%d, duration,%v", c.id, rowCount+lblCount, duration))
+	level.Info(c.logger).Log("metric", fmt.Sprintf("BGWriter%d: Processed samples count,%d, duration,%v", c.id, rowCount, duration))
 }
 
 // Push - Push element at then end of list
@@ -243,58 +218,20 @@ func NewClient(logger log.Logger, cfg *Config) *Client {
 func (c *PGWriter) setupPgPrometheus() error {
 	level.Info(c.logger).Log("msg", "creating tables")
 
-	_, err := c.DB.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS metric_labels ( metric_id BIGINT PRIMARY KEY, metric_name TEXT NOT NULL, metric_name_label TEXT NOT NULL, metric_labels jsonb, UNIQUE(metric_name, metric_labels) )")
+	_, err := c.DB.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS metrics ( time timestamptz, name TEXT NOT NULL, value FLOAT8, labels jsonb, UNIQUE(time, name, labels) ) PARTITION BY RANGE (time)")
 	if err != nil {
 		return err
 	}
 
-	_, err = c.DB.Exec(context.Background(), "CREATE INDEX IF NOT EXISTS metric_labels_labels_idx ON metric_labels USING GIN (metric_labels)")
+	_, err = c.DB.Exec(context.Background(), "CREATE INDEX IF NOT EXISTS metrics_time_brin_idx ON metrics USING BRIN (time)")
 	if err != nil {
 		return err
 	}
 
-	_, err = c.DB.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS metric_values (metric_id BIGINT, metric_time TIMESTAMPTZ, metric_value FLOAT8 ) PARTITION BY RANGE (metric_time)")
+	_, err = c.DB.Exec(context.Background(), "CREATE INDEX IF NOT EXISTS metrics_name_time_idx on metrics USING btree (name, time DESC)")
 	if err != nil {
 		return err
 	}
-
-	_, err = c.DB.Exec(context.Background(), "CREATE INDEX IF NOT EXISTS metric_values_id_time_idx on metric_values USING btree (metric_id, metric_time DESC)")
-	if err != nil {
-		return err
-	}
-
-	_, err = c.DB.Exec(context.Background(), "CREATE INDEX IF NOT EXISTS metric_values_time_idx  on metric_values USING btree (metric_time DESC)")
-	if err != nil {
-		return err
-	}
-
-	vMetricIDMapMutex.Lock()
-	defer vMetricIDMapMutex.Unlock()
-	vMetricIDMap = make(tMetricIDMap)
-	rows, err1 := c.DB.Query(context.Background(), "SELECT metric_name_label, metric_id from metric_labels")
-
-	if err1 != nil {
-		rows.Close()
-		level.Info(c.logger).Log("msg", "Error reading metric_labels")
-		return err
-	}
-
-	for rows.Next() {
-		var (
-			metricNameLabel string
-			metricID        int64
-		)
-		err := rows.Scan(&metricNameLabel, &metricID)
-
-		if err != nil {
-			rows.Close()
-			level.Info(c.logger).Log("msg", "Error scaning metric_labels")
-			return err
-		}
-		vMetricIDMap[metricNameLabel] = metricID
-	}
-	level.Info(c.logger).Log("msg", fmt.Sprintf("%d Rows Loaded in map: ", len(vMetricIDMap)))
-	rows.Close()
 
 	return nil
 }
@@ -304,18 +241,18 @@ func (c *PGWriter) setupPgPartitions(partitionScheme string, lastPartitionTS tim
 	eDate := sDate
 	if partitionScheme == "daily" {
 		level.Info(c.logger).Log("msg", "Creating partition, daily")
-		_, err := c.DB.Exec(context.Background(), fmt.Sprintf("CREATE TABLE IF NOT EXISTS metric_values_%s PARTITION OF metric_values FOR VALUES FROM ('%s 00:00:00') TO ('%s 00:00:00')", sDate.Format("20060102"), sDate.Format("2006-01-02"), eDate.AddDate(0, 0, 1).Format("2006-01-02")))
+		_, err := c.DB.Exec(context.Background(), fmt.Sprintf("CREATE TABLE IF NOT EXISTS metrics_%s PARTITION OF metrics FOR VALUES FROM ('%s 00:00:00') TO ('%s 00:00:00')", sDate.Format("20060102"), sDate.Format("2006-01-02"), eDate.AddDate(0, 0, 1).Format("2006-01-02")))
 		if err != nil {
 			return err
 		}
 	} else if partitionScheme == "hourly" {
-		sql := fmt.Sprintf("CREATE TABLE IF NOT EXISTS metric_values_%s PARTITION OF metric_values FOR VALUES FROM ('%s 00:00:00') TO ('%s 00:00:00') PARTITION BY RANGE (metric_time);", sDate.Format("20060102"), sDate.Format("2006-01-02"), eDate.AddDate(0, 0, 1).Format("2006-01-02"))
+		sql := fmt.Sprintf("CREATE TABLE IF NOT EXISTS metrics_%s PARTITION OF metrics FOR VALUES FROM ('%s 00:00:00') TO ('%s 00:00:00') PARTITION BY RANGE (time);", sDate.Format("20060102"), sDate.Format("2006-01-02"), eDate.AddDate(0, 0, 1).Format("2006-01-02"))
 		var h int
 		for h = 0; h < 23; h++ {
-			sql = fmt.Sprintf("%s CREATE TABLE IF NOT EXISTS metric_values_%s_%02d PARTITION OF metric_values_%s FOR VALUES FROM ('%s %02d:00:00') TO ('%s %02d:00:00');", sql, sDate.Format("20060102"), h, sDate.Format("20060102"), sDate.Format("2006-01-02"), h, eDate.Format("2006-01-02"), h+1)
+			sql = fmt.Sprintf("%s CREATE TABLE IF NOT EXISTS metrics_%s_%02d PARTITION OF metrics_%s FOR VALUES FROM ('%s %02d:00:00') TO ('%s %02d:00:00');", sql, sDate.Format("20060102"), h, sDate.Format("20060102"), sDate.Format("2006-01-02"), h, eDate.Format("2006-01-02"), h+1)
 		}
 		level.Info(c.logger).Log("msg", "Creating partition, hourly")
-		_, err := c.DB.Exec(context.Background(), fmt.Sprintf("%s CREATE TABLE IF NOT EXISTS metric_values_%s_%02d PARTITION OF metric_values_%s FOR VALUES FROM ('%s %02d:00:00') TO ('%s 00:00:00');", sql, sDate.Format("20060102"), h, sDate.Format("20060102"), sDate.Format("2006-01-02"), h, eDate.AddDate(0, 0, 1).Format("2006-01-02")))
+		_, err := c.DB.Exec(context.Background(), fmt.Sprintf("%s CREATE TABLE IF NOT EXISTS metrics_%s_%02d PARTITION OF metrics_%s FOR VALUES FROM ('%s %02d:00:00') TO ('%s 00:00:00');", sql, sDate.Format("20060102"), h, sDate.Format("20060102"), sDate.Format("2006-01-02"), h, eDate.AddDate(0, 0, 1).Format("2006-01-02")))
 		if err != nil {
 			return err
 		}
@@ -542,16 +479,16 @@ func (c *Client) buildQuery(q *prompb.Query) (string, error) {
 			switch m.Type {
 			case prompb.LabelMatcher_EQ:
 				if len(escapedValue) == 0 {
-					matchers = append(matchers, fmt.Sprintf("(l.metric_name IS NULL OR name = '')"))
+					matchers = append(matchers, fmt.Sprintf("(name IS NULL OR name = '')"))
 				} else {
-					matchers = append(matchers, fmt.Sprintf("l.metric_name = '%s'", escapedValue))
+					matchers = append(matchers, fmt.Sprintf("name = '%s'", escapedValue))
 				}
 			case prompb.LabelMatcher_NEQ:
-				matchers = append(matchers, fmt.Sprintf("l.metric_name != '%s'", escapedValue))
+				matchers = append(matchers, fmt.Sprintf("name != '%s'", escapedValue))
 			case prompb.LabelMatcher_RE:
-				matchers = append(matchers, fmt.Sprintf("l.metric_name ~ '%s'", anchorValue(escapedValue)))
+				matchers = append(matchers, fmt.Sprintf("name ~ '%s'", anchorValue(escapedValue)))
 			case prompb.LabelMatcher_NRE:
-				matchers = append(matchers, fmt.Sprintf("l.metric_name !~ '%s'", anchorValue(escapedValue)))
+				matchers = append(matchers, fmt.Sprintf("name !~ '%s'", anchorValue(escapedValue)))
 			default:
 				return "", fmt.Errorf("unknown metric name match type %v", m.Type)
 			}
@@ -562,17 +499,17 @@ func (c *Client) buildQuery(q *prompb.Query) (string, error) {
 					// From the PromQL docs: "Label matchers that match
 					// empty label values also select all time series that
 					// do not have the specific label set at all."
-					matchers = append(matchers, fmt.Sprintf("((l.metric_labels ? '%s') = false OR (l.metric_labels->>'%s' = ''))",
+					matchers = append(matchers, fmt.Sprintf("((labels ? '%s') = false OR (labels->>'%s' = ''))",
 						escapedName, escapedName))
 				} else {
 					labelEqualPredicates[escapedName] = escapedValue
 				}
 			case prompb.LabelMatcher_NEQ:
-				matchers = append(matchers, fmt.Sprintf("l.metric_labels->>'%s' != '%s'", escapedName, escapedValue))
+				matchers = append(matchers, fmt.Sprintf("labels->>'%s' != '%s'", escapedName, escapedValue))
 			case prompb.LabelMatcher_RE:
-				matchers = append(matchers, fmt.Sprintf("l.metric_labels->>'%s' ~ '%s'", escapedName, anchorValue(escapedValue)))
+				matchers = append(matchers, fmt.Sprintf("labels->>'%s' ~ '%s'", escapedName, anchorValue(escapedValue)))
 			case prompb.LabelMatcher_NRE:
-				matchers = append(matchers, fmt.Sprintf("l.metric_labels->>'%s' !~ '%s'", escapedName, anchorValue(escapedValue)))
+				matchers = append(matchers, fmt.Sprintf("labels->>'%s' !~ '%s'", escapedName, anchorValue(escapedValue)))
 			default:
 				return "", fmt.Errorf("unknown match type %v", m.Type)
 			}
@@ -586,13 +523,13 @@ func (c *Client) buildQuery(q *prompb.Query) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		equalsPredicate = fmt.Sprintf(" AND l.metric_labels @> '%s'", labelsJSON)
+		equalsPredicate = fmt.Sprintf(" AND labels @> '%s'", labelsJSON)
 	}
 
-	matchers = append(matchers, fmt.Sprintf("v.metric_time >= '%v'", toTimestamp(q.StartTimestampMs).Format(time.RFC3339)))
-	matchers = append(matchers, fmt.Sprintf("v.metric_time <= '%v'", toTimestamp(q.EndTimestampMs).Format(time.RFC3339)))
+	matchers = append(matchers, fmt.Sprintf("time >= '%v'", toTimestamp(q.StartTimestampMs).Format(time.RFC3339)))
+	matchers = append(matchers, fmt.Sprintf("time <= '%v'", toTimestamp(q.EndTimestampMs).Format(time.RFC3339)))
 
-	return fmt.Sprintf("SELECT v.metric_time, l.metric_name, v.metric_value, l.metric_labels FROM metric_values v, metric_labels l WHERE l.metric_id = v.metric_id and %s %s ORDER BY v.metric_time",
+	return fmt.Sprintf("SELECT time, name, value, labels FROM metrics WHERE %s %s ORDER BY time",
 		strings.Join(matchers, " AND "), equalsPredicate), nil
 }
 
