@@ -80,7 +80,10 @@ func (p *PGParser) RunPGParser(tid int, partitionScheme string, c *PGWriter) {
 				i := strings.Index(sMetric, "{")
 				jsonbMap := make(map[string]interface{})
 				json.Unmarshal([]byte(sMetric[i:]), &jsonbMap)
+
+				c.PGWriterMutex.Lock()
 				c.valueRows = append(c.valueRows, []interface{}{toTimestamp(milliseconds), sMetric[:i], float64(sample.Value), jsonbMap})
+				c.PGWriterMutex.Unlock()
 
 				if ts.Year() != p.lastPartitionTS.Year() ||
 					ts.Month() != p.lastPartitionTS.Month() ||
@@ -162,7 +165,7 @@ func (c *PGWriter) PGWriterSave() {
 		level.Error(c.logger).Log("msg", "COPY failed for metrics", "err", err)
 	}
 	if copyCount != rowCount {
-		level.Error(c.logger).Log("msg", "All rows not copied metrics", "err", err)
+		level.Error(c.logger).Log("msg", "All rows not copied metrics", "copyCount", copyCount, "rowCount", rowCount)
 	}
 
 	duration := time.Since(begin).Seconds()
